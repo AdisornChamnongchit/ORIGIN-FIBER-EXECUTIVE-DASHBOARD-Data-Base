@@ -1,0 +1,25 @@
+# Local Codex and temporary work files
+.codex-work/
+.codex_tmp/
+.tmp_*/
+
+# Generated assets and unrelated workspace outputs
+output/
+outputs/
+deliverables/
+ROM_Model_Executive_Summary_2026*/
+ROM_Model_Executive_Summary_2026*.pptx
+ROM_Model_Executive_Summary_2026*.ndjson
+orf-lead-entry-app/
+
+# Local dependencies and unrelated utilities
+node_modules
+*.inspect.ndjson
+build_performance_template.mjs
+create_complaint_visuals.py
+create_complaint_visuals.swift
+font_test.py
+test.html
+
+# OS files
+.DS_Store
