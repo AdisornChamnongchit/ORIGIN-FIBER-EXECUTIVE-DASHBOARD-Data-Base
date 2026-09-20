@@ -31,11 +31,29 @@ const LINE_PROP_WEBHOOK_KEY = 'LINE_WEBHOOK_KEY';
 const LINE_DAILY_FUNCTION = 'sendDailyLineReport';
 const LINE_DAILY_HOUR = 20;
 
-function doGet() {
+function doGet(e) {
+  if (e && e.parameter && e.parameter.api === 'dashboard') {
+    return serveDashboardApi_(e);
+  }
   return HtmlService.createHtmlOutputFromFile('index')
     .setTitle('Executive Dashboard | Origin Fiber 2026')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
     .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover');
+}
+
+/**
+ * Public read-only endpoint for the separately hosted dashboard.
+ * JSONP is used because Apps Script ContentService cannot attach custom CORS headers.
+ */
+function serveDashboardApi_(e) {
+  const callback = clean_(e.parameter.callback);
+  if (!/^[A-Za-z_$][0-9A-Za-z_$\.]{0,127}$/.test(callback)) {
+    return ContentService.createTextOutput(JSON.stringify({ error: 'Invalid callback' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  const payload = getDashboardData(false);
+  return ContentService.createTextOutput(callback + '(' + JSON.stringify(payload) + ');')
+    .setMimeType(ContentService.MimeType.JAVASCRIPT);
 }
 
 /**
