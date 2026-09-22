@@ -205,11 +205,64 @@ function readLineReportRows_(dateStr) {
   LINE_REPORT_ZONES.forEach(function (name) {
     const config = configByName[name];
     if (!config) throw new Error('ไม่พบการตั้งค่าโซน ' + name);
-    readSheet_(ss.getSheetByName(name), config).forEach(function (row) {
-      if (row.DateStr === dateStr) rows.push(row);
-    });
+    Array.prototype.push.apply(rows, readLineReportSheetForDate_(ss.getSheetByName(name), config, dateStr));
   });
   return rows;
+}
+
+/**
+ * อ่านคอลัมน์วันที่ก่อน แล้วดึงรายละเอียดเฉพาะช่วงแถวของวันที่รายงาน
+ * เพื่อไม่ให้ Daily LINE trigger ต้องประมวลผลข้อมูลทั้งปีจากทุกชีต
+ */
+function readLineReportSheetForDate_(sheet, config, dateStr) {
+  if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) return [];
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0].map(normalizeHeader_);
+  const indexes = resolveIndexes_(headers, config.type);
+  if (indexes.date < 0) throw new Error('ไม่พบคอลัมน์วันที่ในชีต ' + config.name);
+
+  const dateValues = sheet.getRange(2, indexes.date + 1, lastRow - 1, 1).getValues();
+  const matchingOffsets = [];
+  dateValues.forEach(function (row, offset) {
+    if (isSameReportDate_(row[0], dateStr)) matchingOffsets.push(offset);
+  });
+  if (!matchingOffsets.length) return [];
+
+  const firstOffset = matchingOffsets[0];
+  const lastOffset = matchingOffsets[matchingOffsets.length - 1];
+  const values = sheet.getRange(firstOffset + 2, 1, lastOffset - firstOffset + 1, lastColumn).getValues();
+  const output = [];
+  values.forEach(function (row) {
+    if (!isSameReportDate_(valueAt_(row, indexes.date), dateStr)) return;
+    const engineer = clean_(valueAt_(row, indexes.engineer));
+    if (!engineer) return;
+    const rawStatus = clean_(valueAt_(row, indexes.status));
+    const status = normalizeStatus_(rawStatus);
+    const reason = clean_(valueAt_(row, indexes.reason)) || (status === 'Completed' ? '' : rawStatus);
+    const cableLen = number_(valueAt_(row, indexes.cable));
+    const basePay = config.type === 'INSTALL' && status === 'Completed' ? 1250 : 0;
+    const cableSurcharge = basePay && cableLen > 325 ? Math.ceil(cableLen - 325) * 6 : 0;
+    output.push({
+      Sheet: config.name, Type: config.type, DateStr: dateStr,
+      Timestamp: parseDate_(valueAt_(row, indexes.date)).getTime(), Day: Number(dateStr.slice(8, 10)),
+      Engineer: engineer, Status: status, Reason: reason,
+      Product: clean_(valueAt_(row, indexes.product)), FibreID: clean_(valueAt_(row, indexes.fibreId)),
+      PlanDate: dateStr, CableLen: cableLen, BasePay: basePay,
+      CableSurcharge: cableSurcharge, TotalPay: basePay + cableSurcharge
+    });
+  });
+  return output;
+}
+
+function isSameReportDate_(value, dateStr) {
+  if (value instanceof Date && !isNaN(value)) {
+    return value.getFullYear() + '-' + String(value.getMonth() + 1).padStart(2, '0') + '-' +
+      String(value.getDate()).padStart(2, '0') === dateStr;
+  }
+  const parsed = parseDate_(value);
+  return parsed ? parsed.getFullYear() + '-' + String(parsed.getMonth() + 1).padStart(2, '0') + '-' +
+    String(parsed.getDate()).padStart(2, '0') === dateStr : false;
 }
 
 function composeLineReportMessages_(dateStr, rows) {
