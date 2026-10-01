@@ -30,6 +30,9 @@ const LINE_PROP_GROUP_ID = 'LINE_REPORT_GROUP_ID';
 const LINE_PROP_WEBHOOK_KEY = 'LINE_WEBHOOK_KEY';
 const LINE_DAILY_FUNCTION = 'sendDailyLineReport';
 const LINE_DAILY_HOUR = 20;
+const LINE_MONTHLY_FUNCTION = 'sendMonthlyLineReport';
+const LINE_MONTHLY_HOUR = 20;
+const LINE_MONTHLY_MINUTE = 30;
 
 function doGet(e) {
   if (e && e.parameter && e.parameter.api === 'dashboard') {
@@ -135,12 +138,68 @@ function setupDailyLineTrigger() {
   return 'ตั้งเวลาส่งรายวันประมาณ 20:00 น. สำเร็จ';
 }
 
+/** สร้าง Trigger ส่งสรุปเดือนก่อนหน้า ทุกวันที่ 1 เวลาประมาณ 20:30 น. */
+function setupMonthlyLineTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (trigger) {
+    if (trigger.getHandlerFunction() === LINE_MONTHLY_FUNCTION) ScriptApp.deleteTrigger(trigger);
+  });
+  const trigger = ScriptApp.newTrigger(LINE_MONTHLY_FUNCTION)
+    .timeBased()
+    .onMonthDay(1)
+    .atHour(LINE_MONTHLY_HOUR)
+    .nearMinute(LINE_MONTHLY_MINUTE)
+    .inTimezone(DASHBOARD_TZ)
+    .create();
+  PropertiesService.getScriptProperties().setProperty('LINE_MONTHLY_TRIGGER_ID', trigger.getUniqueId());
+  return 'ตั้งเวลาส่ง Monthly Report ทุกวันที่ 1 ประมาณ 20:30 น. สำเร็จ';
+}
+
 /** ฟังก์ชันที่ Time-driven trigger เรียกทุกวัน โดยส่งข้อมูลย้อนหลัง 1 วัน */
 function sendDailyLineReport() {
   const reportDate = new Date();
   reportDate.setDate(reportDate.getDate() - 1);
   const dateStr = Utilities.formatDate(reportDate, DASHBOARD_TZ, 'yyyy-MM-dd');
   return sendLineReportForDate(dateStr);
+}
+
+/** ส่ง Monthly Report ของเดือนก่อนหน้า แยกจาก Daily Report */
+function sendMonthlyLineReport() {
+  const reportMonth = new Date();
+  reportMonth.setDate(1);
+  reportMonth.setMonth(reportMonth.getMonth() - 1);
+  const monthStr = Utilities.formatDate(reportMonth, DASHBOARD_TZ, 'yyyy-MM');
+  return sendLineMonthlyReportForMonth(monthStr);
+}
+
+/** ส่ง Monthly Report สำหรับเดือนที่ระบุ เช่น 2026-09 */
+function sendLineMonthlyReportForMonth(monthInput) {
+  const monthStr = normalizeReportMonth_(monthInput);
+  const properties = PropertiesService.getScriptProperties();
+  const token = properties.getProperty(LINE_PROP_TOKEN);
+  const groupId = properties.getProperty(LINE_PROP_GROUP_ID);
+  if (!token) throw new Error('ยังไม่ได้ตั้ง Script Property: ' + LINE_PROP_TOKEN);
+  if (!groupId) throw new Error('ยังไม่พบ groupId ของ ORF Report กรุณาส่งคำว่า #setup ในกลุ่มหลังเปิด webhook');
+
+  const summary = getLineGroupSummary_(groupId, token);
+  const verifiedName = properties.getProperty('LINE_REPORT_GROUP_VERIFIED_NAME');
+  if ((summary && clean_(summary.groupName) !== LINE_REPORT_GROUP_NAME) ||
+      (!summary && verifiedName !== LINE_REPORT_GROUP_NAME)) {
+    throw new Error('ยกเลิกการส่ง: groupId ไม่ใช่กลุ่ม ' + LINE_REPORT_GROUP_NAME);
+  }
+
+  const rows = readLineReportRowsForMonth_(monthStr);
+  const messages = composeLineMonthlyReportMessages_(monthStr, rows);
+  pushLineMessages_(groupId, messages, token);
+
+  properties.setProperty('LINE_LAST_MONTHLY_SENT_PERIOD', monthStr);
+  properties.setProperty('LINE_LAST_MONTHLY_SENT_AT', new Date().toISOString());
+  properties.setProperty('LINE_LAST_MONTHLY_SENT_MESSAGE_COUNT', String(messages.length));
+  return {
+    month: monthStr,
+    groupName: summary ? summary.groupName : verifiedName,
+    rows: rows.length,
+    messages: messages.length
+  };
 }
 
 /** ใช้ทดสอบข้อมูลตัวอย่างที่ผู้ใช้ตรวจสอบแล้ว */
@@ -191,9 +250,12 @@ function getLineBotStatus() {
     groupName: groupName,
     groupIdMasked: groupId ? groupId.slice(0, 5) + '…' + groupId.slice(-4) : '',
     schedule: 'ทุกวันประมาณ 20:00 น. (' + DASHBOARD_TZ + ')',
+    monthlySchedule: 'ทุกวันที่ 1 ประมาณ 20:30 น. (' + DASHBOARD_TZ + ')',
     zones: LINE_REPORT_ZONES.slice(),
     lastSentDate: p.getProperty('LINE_LAST_SENT_DATE') || '',
-    lastSentAt: p.getProperty('LINE_LAST_SENT_AT') || ''
+    lastSentAt: p.getProperty('LINE_LAST_SENT_AT') || '',
+    lastMonthlySentPeriod: p.getProperty('LINE_LAST_MONTHLY_SENT_PERIOD') || '',
+    lastMonthlySentAt: p.getProperty('LINE_LAST_MONTHLY_SENT_AT') || ''
   };
 }
 
@@ -208,6 +270,69 @@ function readLineReportRows_(dateStr) {
     Array.prototype.push.apply(rows, readLineReportSheetForDate_(ss.getSheetByName(name), config, dateStr));
   });
   return rows;
+}
+
+/** อ่านข้อมูลของทั้งเดือนจากแต่ละชีตเพียงรอบเดียว เพื่อไม่ให้ Trigger ทำงานเกินเวลา */
+function readLineReportRowsForMonth_(monthStr) {
+  const ss = SpreadsheetApp.openById(DASHBOARD_SPREADSHEET_ID);
+  const configByName = {};
+  DASHBOARD_SHEETS.forEach(function (item) { configByName[item.name] = item; });
+  const rows = [];
+  LINE_REPORT_ZONES.forEach(function (name) {
+    const config = configByName[name];
+    if (!config) throw new Error('ไม่พบการตั้งค่าโซน ' + name);
+    Array.prototype.push.apply(rows, readLineReportSheetForMonth_(ss.getSheetByName(name), config, monthStr));
+  });
+  return rows;
+}
+
+function readLineReportSheetForMonth_(sheet, config, monthStr) {
+  if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) return [];
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0].map(normalizeHeader_);
+  const indexes = resolveIndexes_(headers, config.type);
+  if (indexes.date < 0) throw new Error('ไม่พบคอลัมน์วันที่ในชีต ' + config.name);
+
+  const dateValues = sheet.getRange(2, indexes.date + 1, lastRow - 1, 1).getValues();
+  const matchingOffsets = [];
+  dateValues.forEach(function (row, offset) {
+    if (reportMonthKey_(row[0]) === monthStr) matchingOffsets.push(offset);
+  });
+  if (!matchingOffsets.length) return [];
+
+  const firstOffset = matchingOffsets[0];
+  const lastOffset = matchingOffsets[matchingOffsets.length - 1];
+  const values = sheet.getRange(firstOffset + 2, 1, lastOffset - firstOffset + 1, lastColumn).getValues();
+  const output = [];
+  values.forEach(function (row) {
+    const date = parseDate_(valueAt_(row, indexes.date));
+    if (!date || reportMonthKey_(date) !== monthStr) return;
+    const engineer = clean_(valueAt_(row, indexes.engineer));
+    if (!engineer) return;
+    const rawStatus = clean_(valueAt_(row, indexes.status));
+    const status = normalizeStatus_(rawStatus);
+    const reason = clean_(valueAt_(row, indexes.reason)) || (status === 'Completed' ? '' : rawStatus);
+    const cableLen = number_(valueAt_(row, indexes.cable));
+    const basePay = config.type === 'INSTALL' && status === 'Completed' ? 1250 : 0;
+    const cableSurcharge = basePay && cableLen > 325 ? Math.ceil(cableLen - 325) * 6 : 0;
+    const dateStr = Utilities.formatDate(date, DASHBOARD_TZ, 'yyyy-MM-dd');
+    output.push({
+      Sheet: config.name, Type: config.type, DateStr: dateStr,
+      Timestamp: date.getTime(), Day: Number(dateStr.slice(8, 10)),
+      Engineer: engineer, Status: status, Reason: reason,
+      Product: clean_(valueAt_(row, indexes.product)), FibreID: clean_(valueAt_(row, indexes.fibreId)),
+      PlanDate: dateStr, CableLen: cableLen, BasePay: basePay,
+      CableSurcharge: cableSurcharge, TotalPay: basePay + cableSurcharge
+    });
+  });
+  return output;
+}
+
+function reportMonthKey_(value) {
+  const date = parseDate_(value);
+  if (!date) return '';
+  return Utilities.formatDate(date, DASHBOARD_TZ, 'yyyy-MM');
 }
 
 /**
@@ -285,6 +410,87 @@ function composeLineReportMessages_(dateStr, rows) {
     Array.prototype.push.apply(output, splitLineText_(message, 4900));
   });
   return output;
+}
+
+function composeLineMonthlyReportMessages_(monthStr, rows) {
+  const byZone = {};
+  LINE_REPORT_ZONES.forEach(function (zone) { byZone[zone] = []; });
+  rows.forEach(function (row) {
+    if (byZone[row.Sheet]) byZone[row.Sheet].push(row);
+  });
+
+  const output = splitLineText_(buildLineMonthlyOverview_(monthStr, rows, byZone), 4900);
+  LINE_REPORT_ZONES.forEach(function (zone) {
+    Array.prototype.push.apply(output, splitLineText_(buildLineMonthlyZoneDetail_(monthStr, zone, byZone[zone]), 4900));
+  });
+  return output;
+}
+
+function buildLineMonthlyOverview_(monthStr, rows, byZone) {
+  const stats = reportStats_(rows);
+  const lines = [
+    '🟠 ORIGIN FIBER · MONTHLY REPORT',
+    'PERFORMANCE SUMMARY — ' + formatLineMonth_(monthStr),
+    '',
+    'งานทั้งหมด  ' + stats.total + ' งาน',
+    '✅ Completed  ' + stats.completed + ' งาน',
+    'Success Rate  ' + stats.successRate + '%',
+    '🔴 Cancel  ' + stats.cancel + ' งาน',
+    '🟡 Postpone  ' + stats.postponed + ' งาน'
+  ];
+  if (stats.other) lines.push('⚪ สถานะอื่น  ' + stats.other + ' งาน');
+  lines.push('', '⚠️ งานที่ต้องติดตาม  ' + stats.followUp + ' งาน');
+  lines.push('คิดเป็น ' + stats.followUpRate + '% ของงานทั้งหมด', '', 'ZONE OVERVIEW');
+  LINE_REPORT_ZONES.forEach(function (zone) {
+    const zoneStats = reportStats_(byZone[zone] || []);
+    lines.push('', zone,
+      '✅ ' + zoneStats.completed + '  🔴 ' + zoneStats.cancel +
+      '  🟡 ' + zoneStats.postponed + '  | รวม ' + zoneStats.total);
+  });
+  lines.push('', 'รายงานประจำเดือน ส่งทุกวันที่ 1 เวลา 20:30 น.');
+  return lines.join('\n');
+}
+
+function buildLineMonthlyZoneDetail_(monthStr, zone, rows) {
+  const stats = reportStats_(rows);
+  const lines = [
+    '🟠 ' + zone,
+    'MONTHLY PERFORMANCE — ' + formatLineMonth_(monthStr),
+    '',
+    'งานทั้งหมด  ' + stats.total + ' งาน',
+    '✅ Completed  ' + stats.completed + ' งาน',
+    'Success Rate  ' + stats.successRate + '%',
+    '🔴 Cancel  ' + stats.cancel + ' งาน',
+    '🟡 Postpone  ' + stats.postponed + ' งาน'
+  ];
+  if (stats.other) lines.push('⚪ สถานะอื่น  ' + stats.other + ' งาน');
+  lines.push('', '⚠️ งานที่ต้องติดตาม  ' + stats.followUp + ' งาน');
+  lines.push('คิดเป็น ' + stats.followUpRate + '% ของงานทั้งหมด');
+
+  const reasons = countReasons_(rows);
+  lines.push('', 'สาเหตุงานไม่สำเร็จสูงสุด');
+  if (!reasons.length) {
+    lines.push('– ไม่มีงาน Cancel / Postpone');
+  } else {
+    reasons.slice(0, 7).forEach(function (item, index) {
+      lines.push((index + 1) + '. ' + item.name + '  ' + item.count + ' งาน');
+    });
+  }
+
+  lines.push('', '────────────────────', 'TEAM PERFORMANCE', '────────────────────');
+  const teams = aggregateLineTeams_(rows);
+  if (!teams.length) {
+    lines.push('', 'ไม่มีข้อมูลทีมช่างในเดือนนี้');
+  } else {
+    teams.forEach(function (team) {
+      lines.push('', team.name,
+        '✅ ' + team.completed + '  🔴 ' + team.cancel + '  🟡 ' + team.postponed + '  | รวม ' + team.total);
+      if (team.other) lines.push('⚪ สถานะอื่น ' + team.other);
+    });
+  }
+  lines.push('', '────────────────────', '✅ Completed  🔴 Cancel  🟡 Postpone');
+  lines.push('', 'เปิด Dashboard', LINE_REPORT_DASHBOARD_URL);
+  return lines.join('\n');
 }
 
 function buildLineOverview_(dateStr, rows, byZone) {
@@ -486,6 +692,25 @@ function normalizeReportDate_(value) {
 function formatLineDate_(dateStr) {
   const parts = dateStr.split('-');
   return Number(parts[2]) + '/' + Number(parts[1]) + '/' + parts[0];
+}
+
+function normalizeReportMonth_(value) {
+  if (value instanceof Date && !isNaN(value)) return Utilities.formatDate(value, DASHBOARD_TZ, 'yyyy-MM');
+  const text = clean_(value);
+  const match = text.match(/^(\d{4})[-\/](\d{1,2})$/);
+  if (!match || Number(match[2]) < 1 || Number(match[2]) > 12) {
+    throw new Error('รูปแบบเดือนไม่ถูกต้อง กรุณาใช้ YYYY-MM: ' + value);
+  }
+  return match[1] + '-' + String(Number(match[2])).padStart(2, '0');
+}
+
+function formatLineMonth_(monthStr) {
+  const thaiMonths = [
+    'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
+    'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'
+  ];
+  const parts = monthStr.split('-');
+  return thaiMonths[Number(parts[1]) - 1] + ' ' + parts[0];
 }
 
 function safeEquals_(left, right) {
